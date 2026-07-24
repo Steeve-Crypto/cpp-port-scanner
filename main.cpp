@@ -1,14 +1,11 @@
 /*
- * Simple multi-threaded TCP Port Scanner in C++
+ * Multi-threaded TCP Port Scanner in C++17
  * Educational / authorized-use only.
  *
  * Build: make
- * Usage: ./portscan <host> <start_port> <end_port> [num_threads]
+ * Usage: ./portscan <host> <start> <end> [threads] [timeout_ms]
  *
- * Example: ./portscan 127.0.0.1 1 1024 50
- *
- * WARNING: Only scan hosts and networks you own or have explicit permission to test.
- * Unauthorized port scanning may be illegal.
+ * WARNING: Only scan systems you own or have explicit permission to test.
  */
 
 #include <iostream>
@@ -19,8 +16,12 @@
 #include <atomic>
 #include <chrono>
 #include <algorithm>
+#include <queue>
+#include <condition_variable>
+#include <csignal>
 #include <cstring>
 #include <cstdlib>
+#include <map>
 #include <netdb.h>
 #include <unistd.h>
 #include <arpa/inet.h>
@@ -29,10 +30,35 @@
 #include <fcntl.h>
 #include <errno.h>
 
-std::mutex cout_mutex;
-std::atomic<int> open_ports_count{0};
+// ANSI colors
+const char* GREEN  = "\033[32m";
+const char* YELLOW = "\033[33m";
+const char* RESET  = "\033[0m";
+const char* BOLD   = "\033[1m";
+
+std::atomic<bool> running{true};
+std::atomic<int> scanned{0};
+std::atomic<int> open_count{0};
+std::mutex results_mutex;
 std::vector<int> open_ports;
-std::mutex open_ports_mutex;
+std::mutex cout_mutex;
+
+// Common service names
+std::map<int, std::string> services = {
+    {20, "ftp-data"}, {21, "ftp"}, {22, "ssh"}, {23, "telnet"},
+    {25, "smtp"}, {53, "dns"}, {80, "http"}, {110, "pop3"},
+    {111, "rpcbind"}, {135, "msrpc"}, {139, "netbios-ssn"},
+    {143, "imap"}, {443, "https"}, {445, "microsoft-ds"},
+    {993, "imaps"}, {995, "pop3s"}, {1433, "mssql"},
+    {1521, "oracle"}, {3306, "mysql"}, {3389, "rdp"},
+    {5432, "postgresql"}, {5900, "vnc"}, {6379, "redis"},
+    {8080, "http-proxy"}, {8443, "https-alt"}, {27017, "mongodb"}
+};
+
+void signal_handler(int) {
+    running = false;
+    std::cerr << "\n" << YELLOW << "[!] Interrupted. Finishing current work..." << RESET << "\n";
+}
 
 bool set_nonblocking(int sock) {
     int flags = fcntl(sock, F_GETFL, 0);
@@ -40,7 +66,7 @@ bool set_nonblocking(int sock) {
     return fcntl(sock, F_SETFL, flags | O_NONBLOCK) != -1;
 }
 
-bool check_port(const std::string& ip, int port, int timeout_ms = 300) {
+bool check_port(const std::string& ip, int port, int timeout_ms) {
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) return false;
 
@@ -59,7 +85,6 @@ bool check_port(const std::string& ip, int port, int timeout_ms = 300) {
 
     int res = connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
     if (res == 0) {
-        // Immediate success (rare for non-blocking)
         close(sock);
         return true;
     }
@@ -69,7 +94,6 @@ bool check_port(const std::string& ip, int port, int timeout_ms = 300) {
         return false;
     }
 
-    // Wait with select for connection or timeout
     fd_set write_fds;
     FD_ZERO(&write_fds);
     FD_SET(sock, &write_fds);
@@ -80,32 +104,71 @@ bool check_port(const std::string& ip, int port, int timeout_ms = 300) {
 
     res = select(sock + 1, nullptr, &write_fds, nullptr, &tv);
     if (res <= 0) {
-        // Timeout or error
         close(sock);
         return false;
     }
 
-    // Check if connection succeeded
     int so_error = 0;
     socklen_t len = sizeof(so_error);
     getsockopt(sock, SOL_SOCKET, SO_ERROR, &so_error, &len);
     close(sock);
-
     return so_error == 0;
 }
 
-void scan_range(const std::string& ip, int start, int end) {
-    for (int port = start; port <= end; ++port) {
-        if (check_port(ip, port)) {
+// Thread-safe work queue of ports
+class PortQueue {
+public:
+    void push(int port) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        q_.push(port);
+        cv_.notify_one();
+    }
+
+    void finish() {
+        std::lock_guard<std::mutex> lock(mtx_);
+        finished_ = true;
+        cv_.notify_all();
+    }
+
+    bool pop(int& port) {
+        std::unique_lock<std::mutex> lock(mtx_);
+        cv_.wait(lock, [this] { return !q_.empty() || finished_ || !running; });
+        if (q_.empty()) return false;
+        port = q_.front();
+        q_.pop();
+        return true;
+    }
+
+private:
+    std::queue<int> q_;
+    std::mutex mtx_;
+    std::condition_variable cv_;
+    bool finished_ = false;
+};
+
+void worker(const std::string& ip, PortQueue& queue, int timeout_ms, int total) {
+    int port;
+    while (running && queue.pop(port)) {
+        if (check_port(ip, port, timeout_ms)) {
             {
-                std::lock_guard<std::mutex> lock(open_ports_mutex);
+                std::lock_guard<std::mutex> lock(results_mutex);
                 open_ports.push_back(port);
             }
+            open_count++;
+            std::string svc = services.count(port) ? services[port] : "";
             {
                 std::lock_guard<std::mutex> lock(cout_mutex);
-                std::cout << "[+] Port " << port << " is OPEN\n";
+                std::cout << GREEN << "[+] " << port;
+                if (!svc.empty()) std::cout << "/" << svc;
+                std::cout << " open" << RESET << "\n";
             }
-            open_ports_count++;
+        }
+        int done = ++scanned;
+        if (done % 50 == 0 || done == total) {
+            std::lock_guard<std::mutex> lock(cout_mutex);
+            int pct = (done * 100) / total;
+            std::cout << YELLOW << "\r[*] Progress: " << done << "/" << total
+                      << " (" << pct << "%)   " << RESET << std::flush;
         }
     }
 }
@@ -127,79 +190,89 @@ std::string resolve_hostname(const std::string& host) {
 }
 
 void print_usage(const char* prog) {
-    std::cerr << "Usage: " << prog << " <host> <start_port> <end_port> [num_threads]\n"
-              << "  host         : IP or hostname to scan\n"
-              << "  start_port   : First port (1-65535)\n"
-              << "  end_port     : Last port (1-65535)\n"
-              << "  num_threads  : Optional, default 100\n\n"
-              << "Example: " << prog << " scanme.nmap.org 20 100 50\n"
-              << "Only use on systems you own or have permission to scan!\n";
+    std::cerr << BOLD << "Usage: " << RESET << prog
+              << " <host> <start_port> <end_port> [threads] [timeout_ms]\n\n"
+              << "  host         IP or hostname\n"
+              << "  start_port   First port (1-65535)\n"
+              << "  end_port     Last port (1-65535)\n"
+              << "  threads      Worker threads (default: 100)\n"
+              << "  timeout_ms   Connect timeout in ms (default: 400)\n\n"
+              << "Example: " << prog << " scanme.nmap.org 1 1000 150 300\n"
+              << YELLOW << "Only scan systems you own or have permission for!\n" << RESET;
 }
 
 int main(int argc, char* argv[]) {
-    if (argc < 4 || argc > 5) {
+    if (argc < 4 || argc > 6) {
         print_usage(argv[0]);
         return 1;
     }
 
     std::string host = argv[1];
     int start_port = std::atoi(argv[2]);
-    int end_port = std::atoi(argv[3]);
-    int num_threads = (argc == 5) ? std::atoi(argv[4]) : 100;
+    int end_port   = std::atoi(argv[3]);
+    int num_threads = (argc >= 5) ? std::atoi(argv[4]) : 100;
+    int timeout_ms  = (argc == 6) ? std::atoi(argv[5]) : 400;
 
-    if (start_port < 1 || end_port > 65535 || start_port > end_port || num_threads < 1) {
-        std::cerr << "Invalid port range or thread count.\n";
+    if (start_port < 1 || end_port > 65535 || start_port > end_port ||
+        num_threads < 1 || timeout_ms < 50) {
+        std::cerr << "Invalid arguments.\n";
         print_usage(argv[0]);
         return 1;
     }
 
     std::string ip = resolve_hostname(host);
     if (ip.empty()) {
-        std::cerr << "Failed to resolve host: " << host << "\n";
+        std::cerr << "Failed to resolve: " << host << "\n";
         return 1;
     }
 
-    std::cout << "Scanning " << host << " (" << ip << ") ports "
-              << start_port << "-" << end_port
-              << " with " << num_threads << " threads...\n\n";
+    std::signal(SIGINT, signal_handler);
+
+    int total = end_port - start_port + 1;
+
+    std::cout << BOLD << "Target: " << RESET << host << " (" << ip << ")\n"
+              << "Ports:  " << start_port << "-" << end_port
+              << "  |  Threads: " << num_threads
+              << "  |  Timeout: " << timeout_ms << "ms\n\n";
+
+    PortQueue queue;
+    for (int p = start_port; p <= end_port; ++p) {
+        queue.push(p);
+    }
 
     auto start_time = std::chrono::steady_clock::now();
 
-    int total_ports = end_port - start_port + 1;
-    int ports_per_thread = total_ports / num_threads;
-    int remainder = total_ports % num_threads;
-
-    std::vector<std::thread> threads;
-    int current = start_port;
-
+    std::vector<std::thread> workers;
     for (int i = 0; i < num_threads; ++i) {
-        int count = ports_per_thread + (i < remainder ? 1 : 0);
-        if (count <= 0) break;
-        int thread_end = current + count - 1;
-        threads.emplace_back(scan_range, ip, current, thread_end);
-        current = thread_end + 1;
+        workers.emplace_back(worker, ip, std::ref(queue), timeout_ms, total);
     }
 
-    for (auto& t : threads) {
+    // All work has been enqueued; signal workers they can exit when queue drains
+    queue.finish();
+
+    for (auto& t : workers) {
         t.join();
     }
 
     auto end_time = std::chrono::steady_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
 
-    // Sort open ports for clean output
     {
-        std::lock_guard<std::mutex> lock(open_ports_mutex);
+        std::lock_guard<std::mutex> lock(results_mutex);
         std::sort(open_ports.begin(), open_ports.end());
     }
 
-    std::cout << "\n========== Scan complete ==========\n";
-    std::cout << "Open ports (" << open_ports_count << "):\n";
+    std::cout << "\n\n" << BOLD << "========== Results ==========" << RESET << "\n";
+    std::cout << "Open ports: " << open_count << "\n";
     for (int p : open_ports) {
-        std::cout << "  " << p << "\n";
+        std::string svc = services.count(p) ? " (" + services[p] + ")" : "";
+        std::cout << GREEN << "  " << p << svc << RESET << "\n";
     }
-    std::cout << "Time taken: " << duration << " ms\n";
-    std::cout << "===================================\n";
+    std::cout << "Scanned: " << scanned << " ports in " << ms << " ms\n";
+    if (ms > 0) {
+        std::cout << "Rate:    " << (scanned * 1000 / ms) << " ports/sec\n";
+    }
+    std::cout << BOLD << "=============================" << RESET << "\n";
 
     return 0;
 }
