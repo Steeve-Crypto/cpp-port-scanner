@@ -1,16 +1,17 @@
 # C++ TCP Port Scanner
 
-A simple, multi-threaded TCP port scanner written in modern C++17.
+Fast multi-threaded TCP port scanner written in C++17.
 
 **Educational / authorized-use only.**
 
 ## Features
 
-- Resolves hostnames to IPv4
-- Multi-threaded scanning (configurable thread count)
-- Non-blocking connect with timeout for reasonable speed
-- Clean sorted list of open ports at the end
-- Lightweight — single source file
+- Work-queue based thread pool (better load balancing)
+- Non-blocking connect with configurable timeout
+- Real-time progress indicator
+- Colored output + common service names
+- Graceful Ctrl+C handling
+- Ports/sec rate reporting
 
 ## Build
 
@@ -18,42 +19,36 @@ A simple, multi-threaded TCP port scanner written in modern C++17.
 make
 ```
 
-Requires a C++17 compiler (g++ / clang++) and POSIX sockets (Linux, macOS, WSL, etc.).
+Requires g++/clang++ with C++17 and POSIX sockets.
 
 ## Usage
 
 ```bash
-./portscan <host> <start_port> <end_port> [num_threads]
+./portscan <host> <start_port> <end_port> [threads] [timeout_ms]
 ```
 
-| Argument     | Description                          | Default |
-|--------------|--------------------------------------|---------|
-| host         | IP address or hostname               | —       |
-| start_port   | First port to scan (1–65535)         | —       |
-| end_port     | Last port to scan (1–65535)          | —       |
-| num_threads  | Number of concurrent threads         | 100     |
+| Argument    | Description                     | Default |
+|-------------|---------------------------------|---------| 
+| host        | IP or hostname                  | —       |
+| start_port  | First port (1–65535)            | —       |
+| end_port    | Last port (1–65535)             | —       |
+| threads     | Number of worker threads        | 100     |
+| timeout_ms  | Connect timeout in milliseconds | 400     |
 
 ### Examples
 
 ```bash
-# Scan common ports on localhost
 ./portscan 127.0.0.1 1 1024
-
-# Faster scan of a wider range
-./portscan scanme.nmap.org 20 1000 200
-
-# Scan a single port
-./portscan 192.168.1.1 22 22
+./portscan scanme.nmap.org 20 1000 200 300
+./portscan 192.168.1.1 22 22 10 500
 ```
 
-## Important Legal Notice
+## Legal Notice
 
-**Only scan systems and networks that you own or have explicit written permission to test.**
+**Only scan systems and networks you own or have explicit permission to test.**
 
-Unauthorized port scanning can be considered a criminal offense under computer misuse laws in many jurisdictions. This tool is provided strictly for educational purposes, penetration testing under contract, and authorized security assessments.
-
-The author assumes no liability for misuse.
+Unauthorized scanning can be illegal. This tool is for education and authorized security work only.
 
 ## License
 
-MIT License — see [LICENSE](LICENSE)
+MIT — see [LICENSE](LICENSE)
