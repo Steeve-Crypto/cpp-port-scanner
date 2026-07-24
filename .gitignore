@@ -1,0 +1,4 @@
+portscan
+*.o
+*.out
+.DS_Store
