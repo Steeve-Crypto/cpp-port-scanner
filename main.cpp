@@ -3,9 +3,15 @@
  * Educational / authorized-use only.
  *
  * Build: make
- * Usage: ./portscan <host> <start> <end> [threads] [timeout_ms]
+ * Usage: ./portscan [options] <host> <start_port> <end_port>
  *
- * WARNING: Only scan systems you own or have explicit permission to test.
+ * Strong ethical guardrails:
+ *   - Localhost and private IPs allowed by default
+ *   - Public targets require --i-have-permission
+ *   - Clear runtime legal banner
+ *
+ * WARNING: Only scan systems you own or have explicit written permission to test.
+ * Unauthorized scanning is illegal in most jurisdictions.
  */
 
 #include <iostream>
@@ -33,6 +39,7 @@
 // ANSI colors
 const char* GREEN  = "\033[32m";
 const char* YELLOW = "\033[33m";
+const char* RED    = "\033[31m";
 const char* RESET  = "\033[0m";
 const char* BOLD   = "\033[1m";
 
@@ -189,29 +196,100 @@ std::string resolve_hostname(const std::string& host) {
     return std::string(ipstr);
 }
 
+// Returns true if the IP is loopback or RFC1918 private
+bool is_private_or_loopback(const std::string& ip) {
+    in_addr addr{};
+    if (inet_pton(AF_INET, ip.c_str(), &addr) != 1) return false;
+
+    uint32_t a = ntohl(addr.s_addr);
+
+    // 127.0.0.0/8
+    if ((a & 0xFF000000) == 0x7F000000) return true;
+    // 10.0.0.0/8
+    if ((a & 0xFF000000) == 0x0A000000) return true;
+    // 172.16.0.0/12
+    if ((a & 0xFFF00000) == 0xAC100000) return true;
+    // 192.168.0.0/16
+    if ((a & 0xFFFF0000) == 0xC0A80000) return true;
+
+    return false;
+}
+
+void print_banner() {
+    std::cout << BOLD << RED
+              << "╔════════════════════════════════════════════════════════════╗\n"
+              << "║  EDUCATIONAL / AUTHORIZED-USE ONLY                         ║\n"
+              << "║  Unauthorized port scanning is illegal in most places.     ║\n"
+              << "║  You must own the target or have explicit written permission.║\n"
+              << "╚════════════════════════════════════════════════════════════╝\n"
+              << RESET << "\n";
+}
+
 void print_usage(const char* prog) {
     std::cerr << BOLD << "Usage: " << RESET << prog
-              << " <host> <start_port> <end_port> [threads] [timeout_ms]\n\n"
+              << " [options] <host> <start_port> <end_port>\n\n"
+              << "Required:\n"
               << "  host         IP or hostname\n"
               << "  start_port   First port (1-65535)\n"
-              << "  end_port     Last port (1-65535)\n"
-              << "  threads      Worker threads (default: 100)\n"
-              << "  timeout_ms   Connect timeout in ms (default: 400)\n\n"
-              << "Example: " << prog << " scanme.nmap.org 1 1000 150 300\n"
-              << YELLOW << "Only scan systems you own or have permission for!\n" << RESET;
+              << "  end_port     Last port (1-65535)\n\n"
+              << "Options:\n"
+              << "  -t, --threads N       Worker threads (default: 100)\n"
+              << "  -T, --timeout MS      Connect timeout ms (default: 400)\n"
+              << "  -p, --i-have-permission\n"
+              << "                        Required for any public (non-private) target\n"
+              << "  -h, --help            Show this help\n\n"
+              << "By default only localhost and private RFC1918 ranges are allowed.\n"
+              << "Public targets require the --i-have-permission flag.\n\n"
+              << "Examples:\n"
+              << "  " << prog << " 127.0.0.1 1 1024\n"
+              << "  " << prog << " 192.168.1.1 22 80 -t 50\n"
+              << "  " << prog << " scanme.nmap.org 20 100 -p -t 80 -T 300\n"
+              << YELLOW << "\nOnly scan systems you own or have explicit permission for!\n" << RESET;
 }
 
 int main(int argc, char* argv[]) {
-    if (argc < 4 || argc > 6) {
+    if (argc < 2) {
         print_usage(argv[0]);
         return 1;
     }
 
-    std::string host = argv[1];
-    int start_port = std::atoi(argv[2]);
-    int end_port   = std::atoi(argv[3]);
-    int num_threads = (argc >= 5) ? std::atoi(argv[4]) : 100;
-    int timeout_ms  = (argc == 6) ? std::atoi(argv[5]) : 400;
+    // Simple argument parsing
+    std::string host;
+    int start_port = 0, end_port = 0;
+    int num_threads = 100;
+    int timeout_ms = 400;
+    bool have_permission = false;
+
+    std::vector<std::string> positional;
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "-h" || arg == "--help") {
+            print_usage(argv[0]);
+            return 0;
+        } else if (arg == "-p" || arg == "--i-have-permission") {
+            have_permission = true;
+        } else if ((arg == "-t" || arg == "--threads") && i + 1 < argc) {
+            num_threads = std::atoi(argv[++i]);
+        } else if ((arg == "-T" || arg == "--timeout") && i + 1 < argc) {
+            timeout_ms = std::atoi(argv[++i]);
+        } else if (arg[0] == '-') {
+            std::cerr << "Unknown option: " << arg << "\n";
+            print_usage(argv[0]);
+            return 1;
+        } else {
+            positional.push_back(arg);
+        }
+    }
+
+    if (positional.size() != 3) {
+        std::cerr << "Error: need exactly <host> <start_port> <end_port>\n\n";
+        print_usage(argv[0]);
+        return 1;
+    }
+
+    host = positional[0];
+    start_port = std::atoi(positional[1].c_str());
+    end_port   = std::atoi(positional[2].c_str());
 
     if (start_port < 1 || end_port > 65535 || start_port > end_port ||
         num_threads < 1 || timeout_ms < 50) {
@@ -220,10 +298,31 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    print_banner();
+
     std::string ip = resolve_hostname(host);
     if (ip.empty()) {
-        std::cerr << "Failed to resolve: " << host << "\n";
+        std::cerr << RED << "Failed to resolve: " << host << RESET << "\n";
         return 1;
+    }
+
+    // Ethical gate
+    bool is_safe = is_private_or_loopback(ip);
+    if (!is_safe && !have_permission) {
+        std::cerr << RED << BOLD
+                  << "\n[BLOCKED] Target " << ip << " is a public address.\n"
+                  << "This tool refuses to scan public targets without explicit consent.\n\n"
+                  << "If (and only if) you own this system or have written authorization,\n"
+                  << "re-run with the flag:  --i-have-permission   (or -p)\n"
+                  << RESET << "\n";
+        return 2;
+    }
+
+    if (!is_safe) {
+        std::cout << YELLOW
+                  << "[!] Public target + permission flag detected.\n"
+                  << "    Proceeding under the assumption you have authorization.\n"
+                  << RESET << "\n";
     }
 
     std::signal(SIGINT, signal_handler);
@@ -247,7 +346,6 @@ int main(int argc, char* argv[]) {
         workers.emplace_back(worker, ip, std::ref(queue), timeout_ms, total);
     }
 
-    // All work has been enqueued; signal workers they can exit when queue drains
     queue.finish();
 
     for (auto& t : workers) {
