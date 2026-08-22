@@ -4,14 +4,24 @@ Fast multi-threaded TCP port scanner written in C++17.
 
 **Educational / authorized-use only.**
 
+## Ethical Guardrails (built-in)
+
+- **Localhost + private RFC1918 ranges** (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16) are allowed by default.
+- **Any public IP** is blocked unless you pass `--i-have-permission` (or `-p`).
+- Strong red legal banner printed on every run.
+- The tool will refuse to scan public targets without the explicit flag.
+
+This is intentional. The goal is education and authorized testing only.
+
 ## Features
 
-- Work-queue based thread pool (better load balancing)
+- Work-queue based thread pool
 - Non-blocking connect with configurable timeout
 - Real-time progress indicator
 - Colored output + common service names
 - Graceful Ctrl+C handling
 - Ports/sec rate reporting
+- Permission gate for public targets
 
 ## Build
 
@@ -24,30 +34,36 @@ Requires g++/clang++ with C++17 and POSIX sockets.
 ## Usage
 
 ```bash
-./portscan <host> <start_port> <end_port> [threads] [timeout_ms]
+./portscan [options] <host> <start_port> <end_port>
 ```
 
-| Argument    | Description                     | Default |
-|-------------|---------------------------------|---------| 
-| host        | IP or hostname                  | —       |
-| start_port  | First port (1–65535)            | —       |
-| end_port    | Last port (1–65535)             | —       |
-| threads     | Number of worker threads        | 100     |
-| timeout_ms  | Connect timeout in milliseconds | 400     |
+| Option / Arg              | Description                                      | Default |
+|---------------------------|--------------------------------------------------|---------|
+| host                      | IP or hostname                                   | —       |
+| start_port / end_port     | Port range (1–65535)                             | —       |
+| -t, --threads N           | Number of worker threads                         | 100     |
+| -T, --timeout MS          | Connect timeout in milliseconds                  | 400     |
+| -p, --i-have-permission   | Required for any public (non-private) target     | off     |
+| -h, --help                | Show help                                        |         |
 
 ### Examples
 
 ```bash
+# Localhost (always allowed)
 ./portscan 127.0.0.1 1 1024
-./portscan scanme.nmap.org 20 1000 200 300
-./portscan 192.168.1.1 22 22 10 500
+
+# Private network (always allowed)
+./portscan 192.168.1.10 22 80 -t 50
+
+# Public target — requires explicit permission flag
+./portscan scanme.nmap.org 20 100 -p -t 80 -T 300
 ```
 
 ## Legal Notice
 
-**Only scan systems and networks you own or have explicit permission to test.**
+**Only scan systems and networks you own or have explicit written permission to test.**
 
-Unauthorized scanning can be illegal. This tool is for education and authorized security work only.
+Unauthorized scanning can be illegal. This tool is for education and authorized security work only. The built-in permission gate exists to reduce accidental misuse.
 
 ## License
 
