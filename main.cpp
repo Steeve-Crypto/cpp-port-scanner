@@ -28,6 +28,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <map>
+#include <sstream>
 #include <netdb.h>
 #include <unistd.h>
 #include <arpa/inet.h>
@@ -36,7 +37,7 @@
 #include <fcntl.h>
 #include <errno.h>
 
-// ANSI colors
+// ANSI colors (disabled in quiet/json)
 const char* GREEN  = "\033[32m";
 const char* YELLOW = "\033[33m";
 const char* RED    = "\033[31m";
@@ -47,8 +48,19 @@ std::atomic<bool> running{true};
 std::atomic<int> scanned{0};
 std::atomic<int> open_count{0};
 std::mutex results_mutex;
-std::vector<int> open_ports;
+
+struct OpenPort {
+    int port;
+    std::string service;
+    std::string banner;
+};
+
+std::vector<OpenPort> open_ports;
 std::mutex cout_mutex;
+
+bool quiet = false;
+bool do_banner = false;
+bool json_out = false;
 
 // Common service names
 std::map<int, std::string> services = {
@@ -64,7 +76,9 @@ std::map<int, std::string> services = {
 
 void signal_handler(int) {
     running = false;
-    std::cerr << "\n" << YELLOW << "[!] Interrupted. Finishing current work..." << RESET << "\n";
+    if (!quiet && !json_out) {
+        std::cerr << "\n" << YELLOW << "[!] Interrupted. Finishing..." << RESET << "\n";
+    }
 }
 
 bool set_nonblocking(int sock) {
@@ -73,13 +87,14 @@ bool set_nonblocking(int sock) {
     return fcntl(sock, F_SETFL, flags | O_NONBLOCK) != -1;
 }
 
-bool check_port(const std::string& ip, int port, int timeout_ms) {
+// Returns {is_open, banner}
+std::pair<bool, std::string> probe_port(const std::string& ip, int port, int timeout_ms) {
     int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) return false;
+    if (sock < 0) return {false, ""};
 
     if (!set_nonblocking(sock)) {
         close(sock);
-        return false;
+        return {false, ""};
     }
 
     sockaddr_in addr{};
@@ -87,42 +102,70 @@ bool check_port(const std::string& ip, int port, int timeout_ms) {
     addr.sin_port = htons(static_cast<uint16_t>(port));
     if (inet_pton(AF_INET, ip.c_str(), &addr.sin_addr) <= 0) {
         close(sock);
-        return false;
+        return {false, ""};
     }
 
     int res = connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
-    if (res == 0) {
+    if (res != 0 && errno != EINPROGRESS) {
         close(sock);
-        return true;
+        return {false, ""};
     }
 
-    if (errno != EINPROGRESS) {
-        close(sock);
-        return false;
+    if (res != 0) {
+        fd_set write_fds;
+        FD_ZERO(&write_fds);
+        FD_SET(sock, &write_fds);
+        timeval tv{};
+        tv.tv_sec = timeout_ms / 1000;
+        tv.tv_usec = (timeout_ms % 1000) * 1000;
+        res = select(sock + 1, nullptr, &write_fds, nullptr, &tv);
+        if (res <= 0) {
+            close(sock);
+            return {false, ""};
+        }
+        int so_error = 0;
+        socklen_t len = sizeof(so_error);
+        getsockopt(sock, SOL_SOCKET, SO_ERROR, &so_error, &len);
+        if (so_error != 0) {
+            close(sock);
+            return {false, ""};
+        }
     }
 
-    fd_set write_fds;
-    FD_ZERO(&write_fds);
-    FD_SET(sock, &write_fds);
+    // Connected. Optionally grab banner.
+    std::string banner;
+    if (do_banner) {
+        int flags = fcntl(sock, F_GETFL, 0);
+        fcntl(sock, F_SETFL, flags & ~O_NONBLOCK);
 
-    timeval tv{};
-    tv.tv_sec = timeout_ms / 1000;
-    tv.tv_usec = (timeout_ms % 1000) * 1000;
+        timeval rtv{};
+        rtv.tv_sec = 0;
+        rtv.tv_usec = 400000; // 400ms
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof(rtv));
 
-    res = select(sock + 1, nullptr, &write_fds, nullptr, &tv);
-    if (res <= 0) {
-        close(sock);
-        return false;
+        // Simple probe for HTTP-like services
+        if (port == 80 || port == 8080 || port == 8000) {
+            const char* req = "HEAD / HTTP/1.0\r\n\r\n";
+            send(sock, req, strlen(req), 0);
+        }
+
+        char buf[256] = {};
+        ssize_t n = recv(sock, buf, sizeof(buf) - 1, 0);
+        if (n > 0) {
+            for (ssize_t i = 0; i < n; ++i) {
+                char c = buf[i];
+                if (c >= 32 && c < 127) banner += c;
+                else if (c == '\n' || c == '\r') banner += ' ';
+            }
+            while (!banner.empty() && banner.back() == ' ') banner.pop_back();
+            if (banner.size() > 80) banner = banner.substr(0, 80) + "...";
+        }
     }
 
-    int so_error = 0;
-    socklen_t len = sizeof(so_error);
-    getsockopt(sock, SOL_SOCKET, SO_ERROR, &so_error, &len);
     close(sock);
-    return so_error == 0;
+    return {true, banner};
 }
 
-// Thread-safe work queue of ports
 class PortQueue {
 public:
     void push(int port) {
@@ -156,25 +199,27 @@ private:
 void worker(const std::string& ip, PortQueue& queue, int timeout_ms, int total) {
     int port;
     while (running && queue.pop(port)) {
-        if (check_port(ip, port, timeout_ms)) {
-            {
-                std::lock_guard<std::mutex> lock(results_mutex);
-                open_ports.push_back(port);
-            }
-            open_count++;
+        auto [is_open, banner] = probe_port(ip, port, timeout_ms);
+        if (is_open) {
             std::string svc = services.count(port) ? services[port] : "";
             {
+                std::lock_guard<std::mutex> lock(results_mutex);
+                open_ports.push_back({port, svc, banner});
+            }
+            open_count++;
+            if (!quiet && !json_out) {
                 std::lock_guard<std::mutex> lock(cout_mutex);
                 std::cout << GREEN << "[+] " << port;
                 if (!svc.empty()) std::cout << "/" << svc;
-                std::cout << " open" << RESET << "\n";
+                if (!banner.empty()) std::cout << "  \"" << banner << "\"";
+                std::cout << RESET << "\n";
             }
         }
         int done = ++scanned;
-        if (done % 50 == 0 || done == total) {
+        if (!quiet && !json_out && (done % 100 == 0 || done == total)) {
             std::lock_guard<std::mutex> lock(cout_mutex);
             int pct = (done * 100) / total;
-            std::cout << YELLOW << "\r[*] Progress: " << done << "/" << total
+            std::cerr << YELLOW << "\r[*] Progress: " << done << "/" << total
                       << " (" << pct << "%)   " << RESET << std::flush;
         }
     }
@@ -196,26 +241,19 @@ std::string resolve_hostname(const std::string& host) {
     return std::string(ipstr);
 }
 
-// Returns true if the IP is loopback or RFC1918 private
 bool is_private_or_loopback(const std::string& ip) {
     in_addr addr{};
     if (inet_pton(AF_INET, ip.c_str(), &addr) != 1) return false;
-
     uint32_t a = ntohl(addr.s_addr);
-
-    // 127.0.0.0/8
-    if ((a & 0xFF000000) == 0x7F000000) return true;
-    // 10.0.0.0/8
-    if ((a & 0xFF000000) == 0x0A000000) return true;
-    // 172.16.0.0/12
-    if ((a & 0xFFF00000) == 0xAC100000) return true;
-    // 192.168.0.0/16
-    if ((a & 0xFFFF0000) == 0xC0A80000) return true;
-
+    if ((a & 0xFF000000) == 0x7F000000) return true; // 127.0.0.0/8
+    if ((a & 0xFF000000) == 0x0A000000) return true; // 10.0.0.0/8
+    if ((a & 0xFFF00000) == 0xAC100000) return true; // 172.16.0.0/12
+    if ((a & 0xFFFF0000) == 0xC0A80000) return true; // 192.168.0.0/16
     return false;
 }
 
 void print_banner() {
+    if (quiet || json_out) return;
     std::cout << BOLD << RED
               << "╔════════════════════════════════════════════════════════════╗\n"
               << "║  EDUCATIONAL / AUTHORIZED-USE ONLY                         ║\n"
@@ -235,6 +273,9 @@ void print_usage(const char* prog) {
               << "Options:\n"
               << "  -t, --threads N       Worker threads (default: 100)\n"
               << "  -T, --timeout MS      Connect timeout ms (default: 400)\n"
+              << "  -b, --banner          Attempt to grab service banners\n"
+              << "  -q, --quiet           Suppress progress and live output\n"
+              << "  --json                Machine-readable JSON output\n"
               << "  -p, --i-have-permission\n"
               << "                        Required for any public (non-private) target\n"
               << "  -h, --help            Show this help\n\n"
@@ -242,9 +283,8 @@ void print_usage(const char* prog) {
               << "Public targets require the --i-have-permission flag.\n\n"
               << "Examples:\n"
               << "  " << prog << " 127.0.0.1 1 1024\n"
-              << "  " << prog << " 192.168.1.1 22 80 -t 50\n"
-              << "  " << prog << " scanme.nmap.org 20 100 -p -t 80 -T 300\n"
-              << YELLOW << "\nOnly scan systems you own or have explicit permission for!\n" << RESET;
+              << "  " << prog << " 192.168.1.1 22 80 -t 50 -b\n"
+              << "  " << prog << " scanme.nmap.org 20 100 -p -b --json\n";
 }
 
 int main(int argc, char* argv[]) {
@@ -253,7 +293,6 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Simple argument parsing
     std::string host;
     int start_port = 0, end_port = 0;
     int num_threads = 100;
@@ -268,6 +307,13 @@ int main(int argc, char* argv[]) {
             return 0;
         } else if (arg == "-p" || arg == "--i-have-permission") {
             have_permission = true;
+        } else if (arg == "-b" || arg == "--banner") {
+            do_banner = true;
+        } else if (arg == "-q" || arg == "--quiet") {
+            quiet = true;
+        } else if (arg == "--json") {
+            json_out = true;
+            quiet = true;
         } else if ((arg == "-t" || arg == "--threads") && i + 1 < argc) {
             num_threads = std::atoi(argv[++i]);
         } else if ((arg == "-T" || arg == "--timeout") && i + 1 < argc) {
@@ -302,23 +348,28 @@ int main(int argc, char* argv[]) {
 
     std::string ip = resolve_hostname(host);
     if (ip.empty()) {
-        std::cerr << RED << "Failed to resolve: " << host << RESET << "\n";
+        std::cerr << (json_out ? "" : RED) << "Failed to resolve: " << host
+                  << (json_out ? "" : RESET) << "\n";
         return 1;
     }
 
-    // Ethical gate
     bool is_safe = is_private_or_loopback(ip);
     if (!is_safe && !have_permission) {
-        std::cerr << RED << BOLD
-                  << "\n[BLOCKED] Target " << ip << " is a public address.\n"
-                  << "This tool refuses to scan public targets without explicit consent.\n\n"
-                  << "If (and only if) you own this system or have written authorization,\n"
-                  << "re-run with the flag:  --i-have-permission   (or -p)\n"
-                  << RESET << "\n";
+        if (!json_out) {
+            std::cerr << RED << BOLD
+                      << "\n[BLOCKED] Target " << ip << " is a public address.\n"
+                      << "This tool refuses to scan public targets without explicit consent.\n\n"
+                      << "If (and only if) you own this system or have written authorization,\n"
+                      << "re-run with the flag:  --i-have-permission   (or -p)\n"
+                      << RESET << "\n";
+        } else {
+            std::cout << "{\"error\":\"public target blocked\",\"ip\":\"" << ip
+                      << "\",\"hint\":\"use --i-have-permission\"}\n";
+        }
         return 2;
     }
 
-    if (!is_safe) {
+    if (!is_safe && !quiet && !json_out) {
         std::cout << YELLOW
                   << "[!] Public target + permission flag detected.\n"
                   << "    Proceeding under the assumption you have authorization.\n"
@@ -329,10 +380,14 @@ int main(int argc, char* argv[]) {
 
     int total = end_port - start_port + 1;
 
-    std::cout << BOLD << "Target: " << RESET << host << " (" << ip << ")\n"
-              << "Ports:  " << start_port << "-" << end_port
-              << "  |  Threads: " << num_threads
-              << "  |  Timeout: " << timeout_ms << "ms\n\n";
+    if (!quiet && !json_out) {
+        std::cout << BOLD << "Target: " << RESET << host << " (" << ip << ")\n"
+                  << "Ports:  " << start_port << "-" << end_port
+                  << "  |  Threads: " << num_threads
+                  << "  |  Timeout: " << timeout_ms << "ms";
+        if (do_banner) std::cout << "  |  Banner: on";
+        std::cout << "\n\n";
+    }
 
     PortQueue queue;
     for (int p = start_port; p <= end_port; ++p) {
@@ -357,20 +412,60 @@ int main(int argc, char* argv[]) {
 
     {
         std::lock_guard<std::mutex> lock(results_mutex);
-        std::sort(open_ports.begin(), open_ports.end());
+        std::sort(open_ports.begin(), open_ports.end(),
+                  [](const OpenPort& a, const OpenPort& b) { return a.port < b.port; });
     }
 
-    std::cout << "\n\n" << BOLD << "========== Results ==========" << RESET << "\n";
-    std::cout << "Open ports: " << open_count << "\n";
-    for (int p : open_ports) {
-        std::string svc = services.count(p) ? " (" + services[p] + ")" : "";
-        std::cout << GREEN << "  " << p << svc << RESET << "\n";
+    if (json_out) {
+        std::cout << "{\n"
+                  << "  \"target\": \"" << host << "\",\n"
+                  << "  \"ip\": \"" << ip << "\",\n"
+                  << "  \"ports_scanned\": " << scanned << ",\n"
+                  << "  \"open_count\": " << open_count << ",\n"
+                  << "  \"duration_ms\": " << ms << ",\n"
+                  << "  \"open_ports\": [";
+        for (size_t i = 0; i < open_ports.size(); ++i) {
+            const auto& op = open_ports[i];
+            if (i) std::cout << ",";
+            std::cout << "\n    {\"port\": " << op.port;
+            if (!op.service.empty()) std::cout << ", \"service\": \"" << op.service << "\"";
+            if (!op.banner.empty()) {
+                std::string b = op.banner;
+                size_t pos = 0;
+                while ((pos = b.find('\"', pos)) != std::string::npos) {
+                    b.replace(pos, 1, "\\\"");
+                    pos += 2;
+                }
+                std::cout << ", \"banner\": \"" << b << "\"";
+            }
+            std::cout << "}";
+        }
+        std::cout << "\n  ]\n}\n";
+        return 0;
     }
-    std::cout << "Scanned: " << scanned << " ports in " << ms << " ms\n";
-    if (ms > 0) {
-        std::cout << "Rate:    " << (scanned * 1000 / ms) << " ports/sec\n";
+
+    if (!quiet) {
+        std::cout << "\n\n" << BOLD << "========== Results ==========" << RESET << "\n";
+        std::cout << "Open ports: " << open_count << "\n";
+        for (const auto& op : open_ports) {
+            std::cout << GREEN << "  " << op.port;
+            if (!op.service.empty()) std::cout << " (" << op.service << ")";
+            if (!op.banner.empty()) std::cout << "  \"" << op.banner << "\"";
+            std::cout << RESET << "\n";
+        }
+        std::cout << "Scanned: " << scanned << " ports in " << ms << " ms\n";
+        if (ms > 0) {
+            std::cout << "Rate:    " << (scanned * 1000 / ms) << " ports/sec\n";
+        }
+        std::cout << BOLD << "=============================" << RESET << "\n";
+    } else {
+        for (const auto& op : open_ports) {
+            std::cout << op.port;
+            if (!op.service.empty()) std::cout << "/" << op.service;
+            if (!op.banner.empty()) std::cout << " \"" << op.banner << "\"";
+            std::cout << "\n";
+        }
     }
-    std::cout << BOLD << "=============================" << RESET << "\n";
 
     return 0;
 }
