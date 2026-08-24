@@ -17,8 +17,9 @@ This is intentional. The goal is education and authorized testing only.
 
 - Work-queue based thread pool
 - Non-blocking connect with configurable timeout
-- Real-time progress indicator
-- Colored output + common service names
+- Optional service banner grabbing (`-b`)
+- Quiet mode (`-q`) and JSON output (`--json`)
+- Real-time progress + colored results
 - Graceful Ctrl+C handling
 - Ports/sec rate reporting
 - Permission gate for public targets
@@ -43,6 +44,9 @@ Requires g++/clang++ with C++17 and POSIX sockets.
 | start_port / end_port     | Port range (1–65535)                             | —       |
 | -t, --threads N           | Number of worker threads                         | 100     |
 | -T, --timeout MS          | Connect timeout in milliseconds                  | 400     |
+| -b, --banner              | Attempt to grab service banners                  | off     |
+| -q, --quiet               | Suppress progress and live output                | off     |
+| --json                    | Machine-readable JSON output                     | off     |
 | -p, --i-have-permission   | Required for any public (non-private) target     | off     |
 | -h, --help                | Show help                                        |         |
 
@@ -52,11 +56,14 @@ Requires g++/clang++ with C++17 and POSIX sockets.
 # Localhost (always allowed)
 ./portscan 127.0.0.1 1 1024
 
-# Private network (always allowed)
-./portscan 192.168.1.10 22 80 -t 50
+# Private network + banner grab
+./portscan 192.168.1.10 22 80 -t 50 -b
 
-# Public target — requires explicit permission flag
-./portscan scanme.nmap.org 20 100 -p -t 80 -T 300
+# Quiet mode (only open ports)
+./portscan 127.0.0.1 1 1000 -q
+
+# Public target with permission + JSON
+./portscan scanme.nmap.org 20 100 -p -b --json
 ```
 
 ## Legal Notice
