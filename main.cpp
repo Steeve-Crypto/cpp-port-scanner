@@ -3,7 +3,7 @@
  * Educational / authorized-use only.
  *
  * Build: make
- * Usage: ./portscan [options] <host> <start_port> <end_port>
+ * Usage: ./portscan [options] <host> [<start_port> <end_port>]
  *
  * Strong ethical guardrails:
  *   - Localhost and private IPs allowed by default
@@ -28,7 +28,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <map>
-#include <sstream>
+#include <fstream>
 #include <netdb.h>
 #include <unistd.h>
 #include <arpa/inet.h>
@@ -37,7 +37,8 @@
 #include <fcntl.h>
 #include <errno.h>
 
-// ANSI colors (disabled in quiet/json)
+#define PORTSCAN_VERSION "1.2.0"
+
 const char* GREEN  = "\033[32m";
 const char* YELLOW = "\033[33m";
 const char* RED    = "\033[31m";
@@ -61,8 +62,13 @@ std::mutex cout_mutex;
 bool quiet = false;
 bool do_banner = false;
 bool json_out = false;
+std::string output_file;
 
-// Common service names
+const std::vector<int> TOP_PORTS = {
+    21, 22, 23, 25, 53, 80, 110, 111, 135, 139, 143, 443, 445,
+    993, 995, 1433, 1521, 3306, 3389, 5432, 5900, 6379, 8080, 8443, 27017
+};
+
 std::map<int, std::string> services = {
     {20, "ftp-data"}, {21, "ftp"}, {22, "ssh"}, {23, "telnet"},
     {25, "smtp"}, {53, "dns"}, {80, "http"}, {110, "pop3"},
@@ -87,7 +93,6 @@ bool set_nonblocking(int sock) {
     return fcntl(sock, F_SETFL, flags | O_NONBLOCK) != -1;
 }
 
-// Returns {is_open, banner}
 std::pair<bool, std::string> probe_port(const std::string& ip, int port, int timeout_ms) {
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) return {false, ""};
@@ -132,7 +137,6 @@ std::pair<bool, std::string> probe_port(const std::string& ip, int port, int tim
         }
     }
 
-    // Connected. Optionally grab banner.
     std::string banner;
     if (do_banner) {
         int flags = fcntl(sock, F_GETFL, 0);
@@ -140,11 +144,10 @@ std::pair<bool, std::string> probe_port(const std::string& ip, int port, int tim
 
         timeval rtv{};
         rtv.tv_sec = 0;
-        rtv.tv_usec = 400000; // 400ms
+        rtv.tv_usec = 400000;
         setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof(rtv));
 
-        // Simple probe for HTTP-like services
-        if (port == 80 || port == 8080 || port == 8000) {
+        if (port == 80 || port == 8080 || port == 8000 || port == 8443) {
             const char* req = "HEAD / HTTP/1.0\r\n\r\n";
             send(sock, req, strlen(req), 0);
         }
@@ -216,9 +219,9 @@ void worker(const std::string& ip, PortQueue& queue, int timeout_ms, int total) 
             }
         }
         int done = ++scanned;
-        if (!quiet && !json_out && (done % 100 == 0 || done == total)) {
+        if (!quiet && !json_out && (done % 50 == 0 || done == total)) {
             std::lock_guard<std::mutex> lock(cout_mutex);
-            int pct = (done * 100) / total;
+            int pct = total ? (done * 100) / total : 100;
             std::cerr << YELLOW << "\r[*] Progress: " << done << "/" << total
                       << " (" << pct << "%)   " << RESET << std::flush;
         }
@@ -245,14 +248,14 @@ bool is_private_or_loopback(const std::string& ip) {
     in_addr addr{};
     if (inet_pton(AF_INET, ip.c_str(), &addr) != 1) return false;
     uint32_t a = ntohl(addr.s_addr);
-    if ((a & 0xFF000000) == 0x7F000000) return true; // 127.0.0.0/8
-    if ((a & 0xFF000000) == 0x0A000000) return true; // 10.0.0.0/8
-    if ((a & 0xFFF00000) == 0xAC100000) return true; // 172.16.0.0/12
-    if ((a & 0xFFFF0000) == 0xC0A80000) return true; // 192.168.0.0/16
+    if ((a & 0xFF000000) == 0x7F000000) return true;
+    if ((a & 0xFF000000) == 0x0A000000) return true;
+    if ((a & 0xFFF00000) == 0xAC100000) return true;
+    if ((a & 0xFFFF0000) == 0xC0A80000) return true;
     return false;
 }
 
-void print_banner() {
+void print_legal_banner() {
     if (quiet || json_out) return;
     std::cout << BOLD << RED
               << "╔════════════════════════════════════════════════════════════╗\n"
@@ -264,27 +267,81 @@ void print_banner() {
 }
 
 void print_usage(const char* prog) {
-    std::cerr << BOLD << "Usage: " << RESET << prog
-              << " [options] <host> <start_port> <end_port>\n\n"
+    std::cerr << BOLD << "portscan " << PORTSCAN_VERSION << RESET << "\n\n"
+              << "Usage: " << prog << " [options] <host> [<start_port> <end_port>]\n\n"
               << "Required:\n"
-              << "  host         IP or hostname\n"
-              << "  start_port   First port (1-65535)\n"
-              << "  end_port     Last port (1-65535)\n\n"
+              << "  host                 IP or hostname\n\n"
+              << "Port selection (choose one style):\n"
+              << "  start_port end_port  Inclusive range (1-65535)\n"
+              << "  --top                Scan curated common ports instead of a range\n\n"
               << "Options:\n"
-              << "  -t, --threads N       Worker threads (default: 100)\n"
-              << "  -T, --timeout MS      Connect timeout ms (default: 400)\n"
-              << "  -b, --banner          Attempt to grab service banners\n"
-              << "  -q, --quiet           Suppress progress and live output\n"
-              << "  --json                Machine-readable JSON output\n"
+              << "  -t, --threads N      Worker threads (default: 100)\n"
+              << "  -T, --timeout MS     Connect timeout ms (default: 400)\n"
+              << "  -b, --banner         Grab service banners\n"
+              << "  -q, --quiet          Suppress progress / live output\n"
+              << "  --json               JSON output\n"
+              << "  -o, --output FILE    Also write results to FILE\n"
               << "  -p, --i-have-permission\n"
-              << "                        Required for any public (non-private) target\n"
-              << "  -h, --help            Show this help\n\n"
-              << "By default only localhost and private RFC1918 ranges are allowed.\n"
-              << "Public targets require the --i-have-permission flag.\n\n"
+              << "                       Required for public targets\n"
+              << "  --version            Print version and exit\n"
+              << "  -h, --help           Show this help\n\n"
+              << "By default only localhost + private RFC1918 ranges are allowed.\n"
+              << "Public targets require --i-have-permission.\n\n"
               << "Examples:\n"
               << "  " << prog << " 127.0.0.1 1 1024\n"
-              << "  " << prog << " 192.168.1.1 22 80 -t 50 -b\n"
-              << "  " << prog << " scanme.nmap.org 20 100 -p -b --json\n";
+              << "  " << prog << " 192.168.1.10 --top -b\n"
+              << "  " << prog << " scanme.nmap.org --top -p -b --json -o result.json\n";
+}
+
+void write_output_file(const std::string& host, const std::string& ip, long ms) {
+    if (output_file.empty()) return;
+
+    std::ofstream out(output_file);
+    if (!out) {
+        std::cerr << "Failed to write " << output_file << "\n";
+        return;
+    }
+
+    bool as_json = json_out ||
+        (output_file.size() >= 5 && output_file.substr(output_file.size() - 5) == ".json");
+
+    if (as_json) {
+        out << "{\n"
+            << "  \"target\": \"" << host << "\",\n"
+            << "  \"ip\": \"" << ip << "\",\n"
+            << "  \"ports_scanned\": " << scanned << ",\n"
+            << "  \"open_count\": " << open_count << ",\n"
+            << "  \"duration_ms\": " << ms << ",\n"
+            << "  \"open_ports\": [";
+        for (size_t i = 0; i < open_ports.size(); ++i) {
+            const auto& op = open_ports[i];
+            if (i) out << ",";
+            out << "\n    {\"port\": " << op.port;
+            if (!op.service.empty()) out << ", \"service\": \"" << op.service << "\"";
+            if (!op.banner.empty()) {
+                std::string b = op.banner;
+                size_t pos = 0;
+                while ((pos = b.find('\"', pos)) != std::string::npos) {
+                    b.replace(pos, 1, "\\\"");
+                    pos += 2;
+                }
+                out << ", \"banner\": \"" << b << "\"";
+            }
+            out << "}";
+        }
+        out << "\n  ]\n}\n";
+    } else {
+        out << "# portscan " << PORTSCAN_VERSION << " results\n";
+        out << "# target: " << host << " (" << ip << ")\n";
+        out << "# scanned: " << scanned << "  open: " << open_count
+            << "  duration_ms: " << ms << "\n\n";
+        for (const auto& op : open_ports) {
+            out << op.port;
+            if (!op.service.empty()) out << "/" << op.service;
+            if (!op.banner.empty()) out << " \"" << op.banner << "\"";
+            out << "\n";
+        }
+    }
 }
 
 int main(int argc, char* argv[]) {
@@ -298,12 +355,16 @@ int main(int argc, char* argv[]) {
     int num_threads = 100;
     int timeout_ms = 400;
     bool have_permission = false;
+    bool use_top = false;
 
     std::vector<std::string> positional;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "-h" || arg == "--help") {
             print_usage(argv[0]);
+            return 0;
+        } else if (arg == "--version") {
+            std::cout << "portscan " << PORTSCAN_VERSION << "\n";
             return 0;
         } else if (arg == "-p" || arg == "--i-have-permission") {
             have_permission = true;
@@ -314,10 +375,14 @@ int main(int argc, char* argv[]) {
         } else if (arg == "--json") {
             json_out = true;
             quiet = true;
+        } else if (arg == "--top") {
+            use_top = true;
         } else if ((arg == "-t" || arg == "--threads") && i + 1 < argc) {
             num_threads = std::atoi(argv[++i]);
         } else if ((arg == "-T" || arg == "--timeout") && i + 1 < argc) {
             timeout_ms = std::atoi(argv[++i]);
+        } else if ((arg == "-o" || arg == "--output") && i + 1 < argc) {
+            output_file = argv[++i];
         } else if (arg[0] == '-') {
             std::cerr << "Unknown option: " << arg << "\n";
             print_usage(argv[0]);
@@ -327,24 +392,38 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    if (positional.size() != 3) {
-        std::cerr << "Error: need exactly <host> <start_port> <end_port>\n\n";
+    if (positional.empty()) {
+        std::cerr << "Error: host required\n\n";
         print_usage(argv[0]);
         return 1;
     }
 
     host = positional[0];
-    start_port = std::atoi(positional[1].c_str());
-    end_port   = std::atoi(positional[2].c_str());
 
-    if (start_port < 1 || end_port > 65535 || start_port > end_port ||
-        num_threads < 1 || timeout_ms < 50) {
-        std::cerr << "Invalid arguments.\n";
-        print_usage(argv[0]);
+    std::vector<int> ports_to_scan;
+    if (use_top) {
+        ports_to_scan = TOP_PORTS;
+    } else {
+        if (positional.size() != 3) {
+            std::cerr << "Error: need <host> <start_port> <end_port>  (or use --top)\n\n";
+            print_usage(argv[0]);
+            return 1;
+        }
+        start_port = std::atoi(positional[1].c_str());
+        end_port   = std::atoi(positional[2].c_str());
+        if (start_port < 1 || end_port > 65535 || start_port > end_port) {
+            std::cerr << "Invalid port range.\n";
+            return 1;
+        }
+        for (int p = start_port; p <= end_port; ++p) ports_to_scan.push_back(p);
+    }
+
+    if (num_threads < 1 || timeout_ms < 50) {
+        std::cerr << "Invalid threads/timeout.\n";
         return 1;
     }
 
-    print_banner();
+    print_legal_banner();
 
     std::string ip = resolve_hostname(host);
     if (ip.empty()) {
@@ -378,21 +457,23 @@ int main(int argc, char* argv[]) {
 
     std::signal(SIGINT, signal_handler);
 
-    int total = end_port - start_port + 1;
+    int total = static_cast<int>(ports_to_scan.size());
 
     if (!quiet && !json_out) {
-        std::cout << BOLD << "Target: " << RESET << host << " (" << ip << ")\n"
-                  << "Ports:  " << start_port << "-" << end_port
-                  << "  |  Threads: " << num_threads
+        std::cout << BOLD << "Target: " << RESET << host << " (" << ip << ")\n";
+        if (use_top) {
+            std::cout << "Mode:   --top (" << total << " common ports)";
+        } else {
+            std::cout << "Ports:  " << start_port << "-" << end_port;
+        }
+        std::cout << "  |  Threads: " << num_threads
                   << "  |  Timeout: " << timeout_ms << "ms";
         if (do_banner) std::cout << "  |  Banner: on";
         std::cout << "\n\n";
     }
 
     PortQueue queue;
-    for (int p = start_port; p <= end_port; ++p) {
-        queue.push(p);
-    }
+    for (int p : ports_to_scan) queue.push(p);
 
     auto start_time = std::chrono::steady_clock::now();
 
@@ -403,9 +484,7 @@ int main(int argc, char* argv[]) {
 
     queue.finish();
 
-    for (auto& t : workers) {
-        t.join();
-    }
+    for (auto& t : workers) t.join();
 
     auto end_time = std::chrono::steady_clock::now();
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
@@ -415,6 +494,8 @@ int main(int argc, char* argv[]) {
         std::sort(open_ports.begin(), open_ports.end(),
                   [](const OpenPort& a, const OpenPort& b) { return a.port < b.port; });
     }
+
+    write_output_file(host, ip, ms);
 
     if (json_out) {
         std::cout << "{\n"
@@ -454,9 +535,8 @@ int main(int argc, char* argv[]) {
             std::cout << RESET << "\n";
         }
         std::cout << "Scanned: " << scanned << " ports in " << ms << " ms\n";
-        if (ms > 0) {
-            std::cout << "Rate:    " << (scanned * 1000 / ms) << " ports/sec\n";
-        }
+        if (ms > 0) std::cout << "Rate:    " << (scanned * 1000 / ms) << " ports/sec\n";
+        if (!output_file.empty()) std::cout << "Wrote:   " << output_file << "\n";
         std::cout << BOLD << "=============================" << RESET << "\n";
     } else {
         for (const auto& op : open_ports) {
